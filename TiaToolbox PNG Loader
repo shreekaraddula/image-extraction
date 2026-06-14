@@ -1,1 +1,129 @@
+import os
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+from PIL import Image
+from tiatoolbox.wsireader import VirtualWSIReader
+from tiatoolbox.tools.patchextractor import GridPatchExtractor
+from tiatoolbox.models.engine.nucleus_predictor import NucleusPredictor
 
+# ========================================================
+# 1. DEFINE METHUC-CGS METADATA STRUCTURE
+# ========================================================
+# Replace this with your pandas read_csv logic matching your dataset index
+# e.g., methuc_metadata = pd.read_csv("methuc_cgs_clinical_manifest.csv").set_index("case_id").to_dict('index')
+methuc_metadata = {
+    "METHUC_CGS_001": {"cms_subtype": "CMS1", "methylation_profile": "CIMP-High", "region": "Tumor"},
+    "METHUC_CGS_002": {"cms_subtype": "CMS2", "methylation_profile": "CIMP-Low", "region": "Tumor"}
+}
+
+# Target file setup
+PNG_FILE = "METHUC_CGS_001_slide.png"
+CASE_ID = "METHUC_CGS_001"  # Extract from filename dynamically if processing a batch
+
+# Pull the clinical grade / molecular profiling metadata
+case_info = methuc_metadata.get(CASE_ID, {"cms_subtype": "Unknown", "methylation_profile": "Unknown", "region": "Unknown"})
+
+# ========================================================
+# 2. INJECT 40X PROPERTIES INTO VIRTUAL WSI READER
+# ========================================================
+# PNG files inherently lack microns-per-pixel (MPP). 
+# Setting MPP to 0.25 simulates a true 40x scanning resolution.
+img_size = Image.open(PNG_FILE).size
+virtual_info = {
+    "mpp": [0.25, 0.25],          
+    "objective_power": 40,
+    "slide_dimensions": img_size,
+}
+reader = VirtualWSIReader(PNG_FILE, info=virtual_info)
+
+# ========================================================
+# 3. ADVANCED QUALITY CONTROL AND ARTIFACT FILTERING
+# ========================================================
+def validate_patch_quality(patch_rgb, max_bg_allowed=20.0):
+    """
+    Validates patch against structural artifacts, tissue folds, and severe blur.
+    """
+    gray = cv2.cvtColor(patch_rgb, cv2.COLOR_RGB2GRAY)
+    
+    # Filter A: Background thresholding (>20% rule)
+    # Bright glass background typically registers near-white pixels (> 225)
+    bg_mask = gray > 225
+    bg_percentage = (np.sum(bg_mask) / gray.size) * 100
+    if bg_percentage > max_bg_allowed:
+        return False, f"Rejected: Background too high ({bg_percentage:.1f}%)"
+        
+    # Filter B: Tissue Fold Identification
+    # Dark, heavily compressed linear folding creates intense local dark edges
+    _, fold_mask = cv2.threshold(gray, 45, 255, cv2.THRESH_BINARY_INV)
+    fold_percentage = (np.sum(fold_mask == 255) / gray.size) * 100
+    if fold_percentage > 4.0:  # Rejects patch if >4% contains severe tissue folding
+        return False, "Rejected: Heavy tissue folding detected"
+        
+    # Filter C: Out-of-Focus / Blur Check (Laplacian Variance)
+    # Sharp 40x cellular resolution has high edge-variance; blurred spots drop heavily
+    blur_variance = cv2.Laplacian(gray, cv2.CV_64F).var()
+    if blur_variance < 95.0:  
+        return False, f"Rejected: Out-of-focus artifact (Variance: {blur_variance:.1f})"
+        
+    return True, "Passed"
+
+# ========================================================
+# 4. INITIALIZE CELL SEGMENTATION MODEL
+# ========================================================
+print("Loading HoVer-Net for statistical cell validation...")
+# hovernet_fast is highly optimized for fast patch-level nuclear boundary estimation
+cell_detector = NucleusPredictor(model_name="hovernet_fast-wsss")
+
+# ========================================================
+# 5. GRID EXTRACTION & CRITERIA FILTERING
+# ========================================================
+# Configure 512x512 non-overlapping tiles at 40x magnification
+patch_extractor = GridPatchExtractor(
+    structures=None,  
+    patch_size=(512, 512),
+    stride=(512, 512),  # Stride matching patch size ensures zero overlap
+    resolution=40.0,
+    units="power"
+)
+
+patch_coordinates = patch_extractor.get_coordinates(reader)
+print(f"Generated {len(patch_coordinates)} initial grid boundaries.")
+
+output_saved_patches = []
+save_directory = "./extracted_methuc_patches"
+os.makedirs(save_directory, exist_ok=True)
+
+for index, coords in enumerate(patch_coordinates):
+    # Rip out raw patch array
+    patch_image = patch_extractor.get_patch(reader, coords)
+    
+    # Apply Quality Control check
+    is_clean, message = validate_patch_quality(patch_image)
+    if not is_clean:
+        print(f"-> Tile {index}: {message}")
+        continue
+        
+    # Execute cell detection to satisfy minimum 100 cell data-reliability rule
+    segmented_cells = cell_detector.predict(imgs=[patch_image], save_dir=None, mode="patch")
+    total_cells = len(segmented_cells)
+    
+    if total_cells < 100:
+        print(f"-> Tile {index}: Rejected due to low cellularity ({total_cells} cells < 100 target)")
+        continue
+        
+    # Target tumor patch is clean and has high cell count -> Apply metadata labels
+    patch_name = f"{CASE_ID}_patch_{index}.png"
+    cv2.imwrite(os.path.join(save_directory, patch_name), cv2.cvtColor(patch_image, cv2.COLOR_RGB2BGR))
+    
+    final_dataset_entry = {
+        "filename": patch_name,
+        "coordinates": coords,
+        "cms_subtype": case_info["cms_subtype"],
+        "methylation": case_info["methylation_profile"],
+        "cell_density": total_cells
+    }
+    output_saved_patches.append(final_dataset_entry)
+    print(f"✅ Saved Tile {index}! Cells: {total_cells} | Subtype: {case_info['cms_subtype']}")
+
+print(f"\nProcessing complete! Successfully generated {len(output_saved_patches)} verified patches.")
