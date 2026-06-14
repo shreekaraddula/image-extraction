@@ -1,0 +1,61 @@
+import os
+import cv2
+import numpy as np
+import pandas as pd
+
+PATCH_SIZE = 512
+BACKGROUND_THRESHOLD = 0.20
+INPUT_IMAGE_PATH = "input.png"
+OUTPUT_DIR = "patches"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+img = cv2.imread(INPUT_IMAGE_PATH)
+
+if img is None:
+    raise ValueError("Image could not be loaded.")
+
+img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+H, W, C = img.shape
+
+def background_ratio(patch):
+    gray = cv2.cvtColor(patch, cv2.COLOR_RGB2GRAY)
+    background = np.sum(gray > 220)
+    total = gray.size
+    return background / total
+
+metadata = []
+patch_id = 0
+
+for y in range(0, H - PATCH_SIZE + 1, PATCH_SIZE):
+    for x in range(0, W - PATCH_SIZE + 1, PATCH_SIZE):
+
+        patch = img[y:y+PATCH_SIZE, x:x+PATCH_SIZE]
+
+        if patch.shape[0] != PATCH_SIZE or patch.shape[1] != PATCH_SIZE:
+            continue
+
+        bg_ratio = background_ratio(patch)
+
+        if bg_ratio > BACKGROUND_THRESHOLD:
+            continue
+
+        filename = f"patch_{patch_id}.png"
+        path = os.path.join(OUTPUT_DIR, filename)
+
+        cv2.imwrite(path, cv2.cvtColor(patch, cv2.COLOR_RGB2BGR))
+
+        metadata.append({
+            "patch_id": patch_id,
+            "filename": filename,
+            "x": x,
+            "y": y,
+            "background_ratio": bg_ratio
+        })
+
+        patch_id += 1
+
+df = pd.DataFrame(metadata)
+df.to_csv(os.path.join(OUTPUT_DIR, "patch_metadata.csv"), index=False)
+
+print(patch_id)
